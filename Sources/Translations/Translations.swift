@@ -24,6 +24,7 @@ public enum Translations {
 
     #if canImport(UIKit)
     private static var overlay: OverlayWindow?
+    private static var presentationWindow: UIWindow?
     private static var availableLocales: [String] = []
     private static var matchCache: [String: MatchResult] = [:]
     private static var presenter: UIViewController?
@@ -210,7 +211,7 @@ public enum Translations {
 
         guard !Task.isCancelled else { return }
 
-        let harvested = StringHarvester.harvest(in: keyWindow)
+        let harvested = await StringHarvester.harvest(in: keyWindow)
         let unique = Array(Set(harvested.map { $0.text }))
         let locale = cfg.defaultLocale ?? deviceLocaleCode()
 
@@ -283,46 +284,101 @@ public enum Translations {
 
     @MainActor
     private static func presentSuggestion(for item: HarvestedString) async {
-        guard let cfg = configuration, let client = client,
-              let m = matchCache[item.text], m.matched, let key = m.key else { return }
+        guard let cfg = configuration, let client = client else { return }
+        guard let match = lookupMatch(for: item.text), match.matched, let key = match.key else { return }
         guard let scene = UIApplication.shared.connectedScenes
                 .compactMap({ $0 as? UIWindowScene })
-                .first(where: { $0.activationState == .foregroundActive }),
-              let host = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController
+                .first(where: { $0.activationState == .foregroundActive })
+                ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
         else { return }
 
         let locale = cfg.defaultLocale ?? deviceLocaleCode()
-        var current: String? = nil
-        // Prefer the on-device cache so opening the suggestion sheet works
-        // offline. Fall back to the server lookup only when the cache is
-        // unavailable.
-        if let cache = cache, await cache.hasDocument {
-            if let lookup = await cache.lookup(key: key, locale: locale),
-               let t = lookup.translations.first(where: { $0.localeCode == locale }) {
-                current = t.value
-            }
-        } else if let lookup = try? await client.lookup(key: key, locale: locale),
-                  let t = lookup.translations.first(where: { $0.localeCode == locale }) {
-            current = t.value
-        }
+
+        // Build the sheet immediately so the user gets instant feedback. The
+        // sheet itself fetches the current translation per-locale via the
+        // closure below, so changing the locale segment always shows the
+        // matching value (or an empty editor when none exists).
         let sheet = SuggestionSheetController(
             sourceText: item.text,
             matchedKey: key,
-            currentTranslation: current,
             availableLocales: availableLocales,
-            initialLocale: locale
-        ) { locale, value in
-            do {
-                _ = try await client.submitSuggestion(key: key, localeCode: locale, value: value)
-                return .success(())
-            } catch {
-                return .failure(error)
+            initialLocale: locale,
+            translationLookup: { localeCode in
+                await fetchCurrentTranslation(key: key, locale: localeCode)
+            },
+            onSubmit: { locale, value in
+                do {
+                    _ = try await client.submitSuggestion(key: key, localeCode: locale, value: value)
+                    return .success(())
+                } catch {
+                    return .failure(error)
+                }
+            },
+            onDismiss: { [weak overlay = overlay] in
+                tearDownPresentationWindow()
+                overlay?.isHidden = false
             }
-        }
+        )
+
+        // Always present on a dedicated window above our overlay so the sheet
+        // is interactive and never intercepted by lingering highlight views.
         let nav = UINavigationController(rootViewController: sheet)
-        var presenter = host
-        while let presented = presenter.presentedViewController { presenter = presented }
-        presenter.present(nav, animated: true)
+        let host = PresentationRootController()
+        host.modalPresentationStyle = .overFullScreen
+        let window = UIWindow(windowScene: scene)
+        window.windowLevel = .alert + 2
+        window.backgroundColor = .clear
+        window.rootViewController = host
+        window.makeKeyAndVisible()
+        presentationWindow = window
+
+        // Hide the overlay highlights while the sheet is up so it always reads
+        // as the front-most surface.
+        overlay?.isHidden = true
+
+        host.present(nav, animated: true)
+    }
+
+    @MainActor
+    private static func tearDownPresentationWindow() {
+        presentationWindow?.isHidden = true
+        presentationWindow?.rootViewController = nil
+        presentationWindow = nil
+    }
+
+    /// Tolerant lookup so OCR-induced whitespace doesn't break matching.
+    private static func lookupMatch(for text: String) -> MatchResult? {
+        if let exact = matchCache[text] { return exact }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let m = matchCache[trimmed] { return m }
+        let collapsed = trimmed
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+        if let m = matchCache[collapsed] { return m }
+        let lowered = collapsed.lowercased()
+        return matchCache.first(where: { $0.key.lowercased() == lowered })?.value
+    }
+
+    @MainActor
+    private static func fetchCurrentTranslation(key: String, locale: String) async -> String? {
+        if let cache = cache, await cache.hasDocument,
+           let lookup = await cache.lookup(key: key, locale: locale),
+           let t = lookup.translations.first {
+            return t.value
+        }
+        if let client = client,
+           let lookup = try? await client.lookup(key: key, locale: locale),
+           let t = lookup.translations.first {
+            return t.value
+        }
+        return nil
+    }
+
+    private final class PresentationRootController: UIViewController {
+        override func loadView() {
+            let v = UIView()
+            v.backgroundColor = .clear
+            view = v
+        }
     }
 
     private static func deviceLocaleCode() -> String {

@@ -4,33 +4,44 @@ import UIKit
 final class SuggestionSheetController: UIViewController {
     private let sourceText: String
     private let matchedKey: String
-    private let currentTranslation: String?
+    private var currentTranslation: String?
     private let availableLocales: [String]
     private let initialLocale: String
     private let onSubmit: (_ locale: String, _ value: String) async -> Result<Void, Error>
+    private let onDismiss: () -> Void
+    /// Async lookup for the current translation of `matchedKey` in a given
+    /// locale. Returns nil when no translation exists.
+    private let translationLookup: (_ locale: String) async -> String?
 
     private let scroll = UIScrollView()
     private let stack = UIStackView()
     private let sourceLabel = UILabel()
     private let currentLabel = UILabel()
+    private let currentLoader = UIActivityIndicatorView(style: .medium)
     private let localePicker = UISegmentedControl()
     private let editor = UITextView()
     private let submit = UIButton(type: .system)
     private let status = UILabel()
     private let activity = UIActivityIndicatorView(style: .medium)
 
+    private var editorIsUserEdited = false
+    private var lastFetchedLocale: String?
+
     init(sourceText: String,
          matchedKey: String,
-         currentTranslation: String?,
          availableLocales: [String],
          initialLocale: String,
-         onSubmit: @escaping (_ locale: String, _ value: String) async -> Result<Void, Error>) {
+         translationLookup: @escaping (_ locale: String) async -> String?,
+         onSubmit: @escaping (_ locale: String, _ value: String) async -> Result<Void, Error>,
+         onDismiss: @escaping () -> Void = {}) {
         self.sourceText = sourceText
         self.matchedKey = matchedKey
-        self.currentTranslation = currentTranslation
+        self.currentTranslation = nil
         self.availableLocales = availableLocales.isEmpty ? [initialLocale] : availableLocales
         self.initialLocale = initialLocale
+        self.translationLookup = translationLookup
         self.onSubmit = onSubmit
+        self.onDismiss = onDismiss
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .pageSheet
         if let sheet = sheetPresentationController {
@@ -45,7 +56,9 @@ final class SuggestionSheetController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
         title = "Suggest Translation"
-        navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .close, target: self, action: #selector(dismissSelf))
+        navigationItem.rightBarButtonItem = UIBarButtonItem(
+            barButtonSystemItem: .close, target: self, action: #selector(dismissSelf)
+        )
 
         scroll.translatesAutoresizingMaskIntoConstraints = false
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -66,16 +79,20 @@ final class SuggestionSheetController: UIViewController {
 
         let currentRow = makeSectionTitle("Current translation")
         currentLabel.numberOfLines = 0
-        currentLabel.text = (currentTranslation?.isEmpty == false) ? currentTranslation : "— none —"
-        currentLabel.textColor = currentTranslation == nil ? .tertiaryLabel : .label
+        currentLoader.hidesWhenStopped = true
+        let currentStack = UIStackView(arrangedSubviews: [currentLabel, currentLoader])
+        currentStack.axis = .horizontal
+        currentStack.spacing = 8
+        currentStack.alignment = .center
+        applyCurrentTranslationLabel()
 
         let localeRow = makeSectionTitle("Locale")
         for (i, code) in availableLocales.enumerated() {
             localePicker.insertSegment(withTitle: code, at: i, animated: false)
         }
-        let initialIndex = availableLocales.firstIndex(of: initialLocale) ?? 0
-        localePicker.selectedSegmentIndex = initialIndex
+        localePicker.selectedSegmentIndex = matchingLocaleIndex()
         localePicker.apportionsSegmentWidthsByContent = true
+        localePicker.addTarget(self, action: #selector(localeChanged), for: .valueChanged)
 
         let editorRow = makeSectionTitle("Your suggestion")
         editor.font = .systemFont(ofSize: 17)
@@ -83,7 +100,8 @@ final class SuggestionSheetController: UIViewController {
         editor.layer.borderWidth = 1
         editor.layer.cornerRadius = 8
         editor.heightAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
-        editor.text = currentTranslation ?? ""
+        editor.text = ""
+        editor.delegate = self
 
         var sub = UIButton.Configuration.filled()
         sub.title = "Submit suggestion"
@@ -101,7 +119,7 @@ final class SuggestionSheetController: UIViewController {
         submitRow.spacing = 10
         submitRow.alignment = .center
 
-        [titleRow, sourceLabel, keyRow, keyLabel, currentRow, currentLabel,
+        [titleRow, sourceLabel, keyRow, keyLabel, currentRow, currentStack,
          localeRow, localePicker, editorRow, editor, submitRow, status]
             .forEach { stack.addArrangedSubview($0) }
 
@@ -119,6 +137,63 @@ final class SuggestionSheetController: UIViewController {
             stack.bottomAnchor.constraint(equalTo: scroll.bottomAnchor, constant: -16),
             stack.widthAnchor.constraint(equalTo: scroll.widthAnchor, constant: -40),
         ])
+
+        loadTranslation(for: currentSelectedLocale())
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        onDismiss()
+    }
+
+    private func currentSelectedLocale() -> String {
+        let idx = max(0, localePicker.selectedSegmentIndex)
+        return availableLocales[min(idx, availableLocales.count - 1)]
+    }
+
+    @objc private func localeChanged() {
+        loadTranslation(for: currentSelectedLocale())
+    }
+
+    private func loadTranslation(for locale: String) {
+        lastFetchedLocale = locale
+        currentLoader.startAnimating()
+        currentLabel.text = "Loading…"
+        currentLabel.textColor = .tertiaryLabel
+        Task { [weak self] in
+            let value = await self?.translationLookup(locale) ?? nil
+            await MainActor.run {
+                guard let self = self, self.lastFetchedLocale == locale else { return }
+                self.currentLoader.stopAnimating()
+                self.currentTranslation = value
+                self.applyCurrentTranslationLabel()
+                if !self.editorIsUserEdited {
+                    self.editor.text = value ?? ""
+                }
+            }
+        }
+    }
+
+    private func applyCurrentTranslationLabel() {
+        if let value = currentTranslation, !value.isEmpty {
+            currentLabel.text = value
+            currentLabel.textColor = .label
+        } else {
+            currentLabel.text = "— none —"
+            currentLabel.textColor = .tertiaryLabel
+        }
+    }
+
+    private func matchingLocaleIndex() -> Int {
+        let norm: (String) -> String = { $0.replacingOccurrences(of: "_", with: "-").lowercased() }
+        let lang: (String) -> String = { norm($0).split(separator: "-").first.map(String.init) ?? norm($0) }
+        if let i = availableLocales.firstIndex(where: { norm($0) == norm(initialLocale) }) {
+            return i
+        }
+        if let i = availableLocales.firstIndex(where: { lang($0) == lang(initialLocale) }) {
+            return i
+        }
+        return 0
     }
 
     private func makeSectionTitle(_ s: String) -> UILabel {
@@ -133,8 +208,7 @@ final class SuggestionSheetController: UIViewController {
 
     @objc private func submitTapped() {
         let value = editor.text ?? ""
-        let idx = max(0, localePicker.selectedSegmentIndex)
-        let locale = availableLocales[idx]
+        let locale = currentSelectedLocale()
         guard !value.isEmpty else {
             status.text = "Translation cannot be empty."
             status.textColor = .systemRed
@@ -159,6 +233,14 @@ final class SuggestionSheetController: UIViewController {
                 }
             }
         }
+    }
+}
+
+extension SuggestionSheetController: UITextViewDelegate {
+    func textViewDidChange(_ textView: UITextView) {
+        // Once the user types something different from the loaded current
+        // translation, stop auto-overwriting when locale changes.
+        editorIsUserEdited = textView.text != (currentTranslation ?? "")
     }
 }
 #endif

@@ -155,10 +155,18 @@ actor XcstringsCache {
                 ))
             }
         }
-        // Filter to the requested locale when one is supplied to mirror the
-        // server's behaviour of returning at most one row per locale.
+        // Filter to the requested locale when one is supplied. Use the
+        // normalised matcher so `en-US`/`en_US`/`en-GB`/`en` interoperate.
         if let locale = locale {
-            translations = translations.filter { $0.localeCode == locale }
+            let normalized = normalizeLocale(locale)
+            let language = languageCode(from: locale)
+            var picked = translations.filter { normalizeLocale($0.localeCode) == normalized }
+            if picked.isEmpty {
+                picked = translations.filter { languageCode(from: $0.localeCode) == language }
+            }
+            if !picked.isEmpty {
+                translations = picked
+            }
         }
         return LookupResponse(
             id: key, key: key, sourceValue: sourceValue,
@@ -187,10 +195,38 @@ actor XcstringsCache {
         source: String
     ) -> String? {
         guard let entry = entry, let locale = locale else { return nil }
-        if locale == source {
-            return entry.localizations?[source]?.stringUnit?.value
+        let locs = entry.localizations ?? [:]
+        if let exact = locs[locale]?.stringUnit?.value, !exact.isEmpty {
+            return exact
         }
-        return entry.localizations?[locale]?.stringUnit?.value
+        // Normalise locale codes so `en-US` matches `en`, `en_US`, `en-GB`, etc.
+        let normalized = normalizeLocale(locale)
+        for (code, loc) in locs {
+            if normalizeLocale(code) == normalized,
+               let value = loc.stringUnit?.value, !value.isEmpty {
+                return value
+            }
+        }
+        // Fall back to any locale starting with the same language.
+        let language = languageCode(from: locale)
+        for (code, loc) in locs {
+            if languageCode(from: code) == language,
+               let value = loc.stringUnit?.value, !value.isEmpty {
+                return value
+            }
+        }
+        if locale == source || language == source {
+            return locs[source]?.stringUnit?.value
+        }
+        return nil
+    }
+
+    private func normalizeLocale(_ s: String) -> String {
+        s.replacingOccurrences(of: "_", with: "-").lowercased()
+    }
+
+    private func languageCode(from s: String) -> String {
+        normalizeLocale(s).split(separator: "-").first.map(String.init) ?? normalizeLocale(s)
     }
 
     private func tokenize(_ s: String) -> Set<String> {
