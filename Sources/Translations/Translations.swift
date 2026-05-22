@@ -1,6 +1,37 @@
 import Foundation
 #if canImport(UIKit)
 import UIKit
+
+private func translationsRuntimeDebugLog(
+    hypothesisId: String,
+    message: String,
+    data: [String: Any] = [:],
+    file: String = #fileID,
+    line: Int = #line
+) {
+    let payload: [String: Any] = [
+        "sessionId": "c482a6",
+        "runId": "visibility-check",
+        "hypothesisId": hypothesisId,
+        "location": "\(file):\(line)",
+        "message": message,
+        "data": data,
+        "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+    ]
+    guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: []),
+          var lineData = String(data: encoded, encoding: .utf8)?.data(using: .utf8) else {
+        return
+    }
+    lineData.append(0x0A)
+    let path = "/Users/marwanelwaraki/Code/.cursor/debug-c482a6.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: lineData)
+        try? handle.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: lineData)
+    }
+}
 #endif
 
 /// The public entry point for the Translations SDK.
@@ -27,6 +58,8 @@ public enum Translations {
     private static var availableLocales: [String] = []
     private static var matchCache: [String: MatchResult] = [:]
     private static var presenter: UIViewController?
+    private static var shakeToTranslateInstalled = false
+    private static var activationTask: Task<Void, Never>?
     #endif
 
     /// Configure the SDK. Must be called once before any other API.
@@ -141,9 +174,22 @@ public enum Translations {
     /// Install the shake-to-translate gesture. Call once at app launch.
     @MainActor
     public static func enableShakeToTranslate() {
+        // #region agent log
+        translationsRuntimeDebugLog(
+            hypothesisId: "H5",
+            message: "enableShakeToTranslate called",
+            data: [
+                "isEnabled": isEnabled,
+                "hasConfiguration": configuration != nil,
+                "alreadyInstalled": shakeToTranslateInstalled
+            ]
+        )
+        // #endregion
         guard isEnabled else { return }
         UIWindow.enableTranslationsShakeForwarding()
         ShakeNotifier.shared.onShake = { Task { @MainActor in toggleTranslationMode() } }
+        guard !shakeToTranslateInstalled else { return }
+        shakeToTranslateInstalled = true
         ShakeNotifier.shared.start()
     }
 
@@ -151,26 +197,54 @@ public enum Translations {
     @MainActor
     public static func openTranslationMode() {
         guard isEnabled else { return }
-        Task { await activate() }
+        guard activationTask == nil else { return }
+        activationTask = Task { @MainActor in
+            await activate()
+            if !Task.isCancelled {
+                activationTask = nil
+            }
+        }
     }
 
     /// Manually close translation mode.
     @MainActor
     public static func closeTranslationMode() {
+        activationTask?.cancel()
+        activationTask = nil
         overlay?.hide()
     }
 
     @MainActor
     private static func toggleTranslationMode() {
-        if let overlay = overlay, overlay.isHidden == false {
+        // #region agent log
+        translationsRuntimeDebugLog(
+            hypothesisId: "H9",
+            message: "toggleTranslationMode called",
+            data: [
+                "hasOverlay": overlay != nil,
+                "overlayVisible": overlay.map { !$0.isHidden } ?? false,
+                "hasActivationTask": activationTask != nil
+            ]
+        )
+        // #endregion
+        if let overlay = overlay, !overlay.isHidden {
+            activationTask?.cancel()
+            activationTask = nil
             overlay.hide()
-        } else {
-            Task { await activate() }
+            return
+        }
+        guard activationTask == nil else { return }
+        activationTask = Task { @MainActor in
+            await activate()
+            if !Task.isCancelled {
+                activationTask = nil
+            }
         }
     }
 
     @MainActor
     private static func activate() async {
+        guard !Task.isCancelled else { return }
         guard let client = client, let cfg = configuration else { return }
         guard let scene = UIApplication.shared.connectedScenes
                 .compactMap({ $0 as? UIWindowScene })
@@ -178,18 +252,38 @@ public enum Translations {
                 ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first,
               let keyWindow = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first
         else { return }
+        // #region agent log
+        translationsRuntimeDebugLog(
+            hypothesisId: "H8",
+            message: "activate scene resolved",
+            data: [
+                "windowCount": scene.windows.count,
+                "keyWindowClass": NSStringFromClass(type(of: keyWindow)),
+                "keyWindowFrame": NSCoder.string(for: keyWindow.frame)
+            ]
+        )
+        // #endregion
 
         if overlay == nil {
             overlay = OverlayWindow(windowScene: scene)
-            overlay?.frame = keyWindow.frame
             overlay?.onTap = { harvested in
                 Task { @MainActor in await presentSuggestion(for: harvested) }
             }
         }
+        overlay?.frame = keyWindow.frame
+
+        guard !Task.isCancelled else { return }
 
         let harvested = StringHarvester.harvest(in: keyWindow)
         let unique = Array(Set(harvested.map { $0.text }))
         let locale = cfg.defaultLocale ?? deviceLocaleCode()
+        // #region agent log
+        translationsRuntimeDebugLog(
+            hypothesisId: "H6",
+            message: "activate harvested strings",
+            data: ["harvestedCount": harvested.count, "uniqueCount": unique.count, "locale": locale]
+        )
+        // #endregion
 
         // Offline-first: if we already have a cached document on disk, use it
         // immediately and refresh in the background. Activation never waits on
@@ -197,6 +291,13 @@ public enum Translations {
         // when the device is offline.
         if let cache = cache {
             await cache.loadFromDiskIfNeeded()
+            // #region agent log
+            translationsRuntimeDebugLog(
+                hypothesisId: "H10",
+                message: "cache status",
+                data: ["hasDocument": await cache.hasDocument]
+            )
+            // #endregion
             if await cache.hasDocument {
                 if availableLocales.isEmpty {
                     availableLocales = await cache.availableLocales()
@@ -207,6 +308,13 @@ public enum Translations {
                 for m in matches where m.matched { matchCache[m.input] = m }
                 refreshCacheInBackground()
                 let displayItems = harvested.filter { matchCache[$0.text]?.matched == true }
+                // #region agent log
+                translationsRuntimeDebugLog(
+                    hypothesisId: "H7",
+                    message: "cache match results",
+                    data: ["matchesCount": matches.count, "displayItemsCount": displayItems.count]
+                )
+                // #endregion
                 overlay?.show(items: displayItems)
                 return
             }
@@ -231,6 +339,13 @@ public enum Translations {
                     )
                     for m in matches where m.matched { matchCache[m.input] = m }
                     let displayItems = harvested.filter { matchCache[$0.text]?.matched == true }
+                    // #region agent log
+                    translationsRuntimeDebugLog(
+                        hypothesisId: "H7",
+                        message: "cold-start cache match results",
+                        data: ["matchesCount": matches.count, "displayItemsCount": displayItems.count]
+                    )
+                    // #endregion
                     overlay?.show(items: displayItems)
                     return
                 }
@@ -241,13 +356,55 @@ public enum Translations {
         // original network endpoints so the SDK keeps working in degraded
         // configurations.
         if availableLocales.isEmpty {
-            if let locales = try? await client.locales() {
+            do {
+                let locales = try await client.locales()
                 availableLocales = locales.map { $0.localeCode }
+                // #region agent log
+                translationsRuntimeDebugLog(
+                    hypothesisId: "H11",
+                    message: "locales fetch success",
+                    data: ["count": locales.count]
+                )
+                // #endregion
+            } catch {
+                // #region agent log
+                translationsRuntimeDebugLog(
+                    hypothesisId: "H11",
+                    message: "locales fetch failed",
+                    data: ["error": String(describing: error)]
+                )
+                // #endregion
             }
         }
-        let matches = (try? await client.match(strings: unique, locale: locale)) ?? []
+        let matches: [MatchResult]
+        do {
+            matches = try await client.match(strings: unique, locale: locale)
+            // #region agent log
+            translationsRuntimeDebugLog(
+                hypothesisId: "H12",
+                message: "match request success",
+                data: ["matchesCount": matches.count]
+            )
+            // #endregion
+        } catch {
+            matches = []
+            // #region agent log
+            translationsRuntimeDebugLog(
+                hypothesisId: "H12",
+                message: "match request failed",
+                data: ["error": String(describing: error), "inputCount": unique.count]
+            )
+            // #endregion
+        }
         for m in matches where m.matched { matchCache[m.input] = m }
         let displayItems = harvested.filter { matchCache[$0.text]?.matched == true }
+        // #region agent log
+        translationsRuntimeDebugLog(
+            hypothesisId: "H7",
+            message: "network match results",
+            data: ["matchesCount": matches.count, "displayItemsCount": displayItems.count]
+        )
+        // #endregion
         overlay?.show(items: displayItems)
     }
 

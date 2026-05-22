@@ -1,5 +1,36 @@
 import Foundation
 
+private func translationsAPIClientDebugLog(
+    hypothesisId: String,
+    message: String,
+    data: [String: Any] = [:],
+    file: String = #fileID,
+    line: Int = #line
+) {
+    let payload: [String: Any] = [
+        "sessionId": "c482a6",
+        "runId": "api-auth-check",
+        "hypothesisId": hypothesisId,
+        "location": "\(file):\(line)",
+        "message": message,
+        "data": data,
+        "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+    ]
+    guard let encoded = try? JSONSerialization.data(withJSONObject: payload, options: []),
+          var lineData = String(data: encoded, encoding: .utf8)?.data(using: .utf8) else {
+        return
+    }
+    lineData.append(0x0A)
+    let path = "/Users/marwanelwaraki/Code/.cursor/debug-c482a6.log"
+    if let handle = FileHandle(forWritingAtPath: path) {
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: lineData)
+        try? handle.close()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: lineData)
+    }
+}
+
 public enum TranslationsError: Error, LocalizedError {
     case notConfigured
     case httpError(status: Int, message: String?)
@@ -40,6 +71,22 @@ final class APIClient: @unchecked Sendable {
         req.httpMethod = method
         req.setValue("Bearer \(configuration.token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        // #region agent log
+        let trimmed = configuration.token.trimmingCharacters(in: .whitespacesAndNewlines)
+        translationsAPIClientDebugLog(
+            hypothesisId: "H13",
+            message: "makeRequest auth snapshot",
+            data: [
+                "url": url.absoluteString,
+                "method": method,
+                "tokenPrefix": String(configuration.token.prefix(12)),
+                "tokenLength": configuration.token.count,
+                "tokenTrimmedLength": trimmed.count,
+                "tokenHasEdgeWhitespace": configuration.token != trimmed,
+                "baseURL": configuration.baseURL.absoluteString
+            ]
+        )
+        // #endregion
         if body != nil {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
@@ -57,8 +104,28 @@ final class APIClient: @unchecked Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw TranslationsError.httpError(status: -1, message: "no response")
         }
+        // #region agent log
+        translationsAPIClientDebugLog(
+            hypothesisId: "H14",
+            message: "send response metadata",
+            data: [
+                "requestURL": request.url?.absoluteString ?? "nil",
+                "statusCode": http.statusCode
+            ]
+        )
+        // #endregion
         if !(200..<300).contains(http.statusCode) {
             let msg = String(data: data, encoding: .utf8)
+            // #region agent log
+            translationsAPIClientDebugLog(
+                hypothesisId: "H15",
+                message: "send non-2xx body excerpt",
+                data: [
+                    "statusCode": http.statusCode,
+                    "bodyPrefix": String((msg ?? "").prefix(140))
+                ]
+            )
+            // #endregion
             throw TranslationsError.httpError(status: http.statusCode, message: msg)
         }
         do {

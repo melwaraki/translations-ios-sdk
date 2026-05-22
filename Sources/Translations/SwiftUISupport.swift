@@ -12,11 +12,10 @@ public extension View {
 
 private struct ShakeInstallerRepresentable: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
-        let v = UIView(frame: .zero)
-        DispatchQueue.main.async {
+        Task { @MainActor in
             Translations.enableShakeToTranslate()
         }
-        return v
+        return UIView(frame: .zero)
     }
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
