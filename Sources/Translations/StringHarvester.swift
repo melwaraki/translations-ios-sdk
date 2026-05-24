@@ -15,8 +15,8 @@ enum StringHarvester {
     ///
     /// This mirrors LocaleReporter's OCR-driven selection UX so SwiftUI and
     /// custom-rendered text are consistently discoverable.
-    static func harvest(in window: UIWindow) async -> [HarvestedString] {
-        if let ocr = await harvestWithOCR(in: window), !ocr.isEmpty {
+    static func harvest(in window: UIWindow, locale: String? = nil) async -> [HarvestedString] {
+        if let ocr = await harvestWithOCR(in: window, locale: locale), !ocr.isEmpty {
             return ocr
         }
         // Fallback for environments where OCR fails unexpectedly.
@@ -25,7 +25,7 @@ enum StringHarvester {
         return Array(seen.values)
     }
 
-    private static func harvestWithOCR(in window: UIWindow) async -> [HarvestedString]? {
+    private static func harvestWithOCR(in window: UIWindow, locale: String?) async -> [HarvestedString]? {
         // Capture any UIKit-derived values on the main actor to avoid main-thread violations
         let captured: (screenshot: UIImage?, imageSize: CGSize, windowBounds: CGRect) = await MainActor.run {
             let shot = captureScreenshot(from: window)
@@ -68,6 +68,7 @@ enum StringHarvester {
             request.recognitionLevel = .accurate
             request.usesLanguageCorrection = true
             request.minimumTextHeight = 0.012
+            request.recognitionLanguages = recognitionLanguages(for: locale)
 
             DispatchQueue.global(qos: .userInitiated).async {
                 let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -115,6 +116,26 @@ enum StringHarvester {
         )
     }
 
+    private static func recognitionLanguages(for locale: String?) -> [String] {
+        var languages: [String] = []
+        if let locale = locale, !locale.isEmpty {
+            languages.append(locale.replacingOccurrences(of: "_", with: "-"))
+            if let language = languages[0].split(separator: "-").first {
+                languages.append(String(language))
+            }
+        }
+        languages.append(contentsOf: Locale.preferredLanguages)
+        languages.append("en-US")
+
+        var seen = Set<String>()
+        return languages.filter { code in
+            let normalized = code.replacingOccurrences(of: "_", with: "-").lowercased()
+            guard !normalized.isEmpty, !seen.contains(normalized) else { return false }
+            seen.insert(normalized)
+            return true
+        }
+    }
+
     private static func walk(_ view: UIView, root: UIWindow, into seen: inout [String: HarvestedString]) {
         if view.isHidden || view.alpha == 0 {
             return
@@ -154,4 +175,3 @@ enum StringHarvester {
     }
 }
 #endif
-

@@ -83,6 +83,15 @@ public enum Translations {
         }
     }
 
+    /// Clears the persisted offline cache for the configured project. Intended
+    /// for development/testing when dashboard locales have changed.
+    public static func clearCache() async {
+        guard let cache = cache else { return }
+        await cache.clear()
+        lastRefreshAt = nil
+        didRefreshThisLaunch = false
+    }
+
     /// Returns true if the configured policy says we should refresh now.
     private static func shouldRefreshNow() -> Bool {
         guard let cfg = configuration else { return false }
@@ -211,9 +220,7 @@ public enum Translations {
 
         guard !Task.isCancelled else { return }
 
-        let harvested = await StringHarvester.harvest(in: keyWindow)
-        let unique = Array(Set(harvested.map { $0.text }))
-        let locale = cfg.defaultLocale ?? deviceLocaleCode()
+        var locale = preferredLocaleCode()
 
         // Offline-first: if we already have a cached document on disk, use it
         // immediately and refresh in the background. Activation never waits on
@@ -225,6 +232,9 @@ public enum Translations {
                 if availableLocales.isEmpty {
                     availableLocales = await cache.availableLocales()
                 }
+                locale = supportedLocale(for: locale, availableLocales: availableLocales)
+                let harvested = await StringHarvester.harvest(in: keyWindow, locale: locale)
+                let unique = Array(Set(harvested.map { $0.text }))
                 let matches = await cache.match(
                     strings: unique, locale: locale, threshold: cfg.matchThreshold
                 )
@@ -250,6 +260,9 @@ public enum Translations {
                     if availableLocales.isEmpty {
                         availableLocales = await cache.availableLocales()
                     }
+                    locale = supportedLocale(for: locale, availableLocales: availableLocales)
+                    let harvested = await StringHarvester.harvest(in: keyWindow, locale: locale)
+                    let unique = Array(Set(harvested.map { $0.text }))
                     let matches = await cache.match(
                         strings: unique, locale: locale, threshold: cfg.matchThreshold
                     )
@@ -271,6 +284,9 @@ public enum Translations {
             } catch {
             }
         }
+        locale = supportedLocale(for: locale, availableLocales: availableLocales)
+        let harvested = await StringHarvester.harvest(in: keyWindow, locale: locale)
+        let unique = Array(Set(harvested.map { $0.text }))
         let matches: [MatchResult]
         do {
             matches = try await client.match(strings: unique, locale: locale)
@@ -292,7 +308,7 @@ public enum Translations {
                 ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
         else { return }
 
-        let locale = cfg.defaultLocale ?? deviceLocaleCode()
+        let locale = supportedLocale(for: preferredLocaleCode(), availableLocales: availableLocales)
 
         // Build the sheet immediately so the user gets instant feedback. The
         // sheet itself fetches the current translation per-locale via the
@@ -381,11 +397,41 @@ public enum Translations {
         }
     }
 
-    private static func deviceLocaleCode() -> String {
+    private static func preferredLocaleCode() -> String {
+        if let configured = configuration?.defaultLocale, !configured.isEmpty {
+            return configured
+        }
+        if let preferred = Locale.preferredLanguages.first, !preferred.isEmpty {
+            return preferred
+        }
+        if let bundleLocale = Bundle.main.preferredLocalizations.first, !bundleLocale.isEmpty {
+            return bundleLocale
+        }
         if #available(iOS 16, *) {
             return Locale.current.identifier(.bcp47)
         }
         return Locale.current.identifier
+    }
+
+    private static func supportedLocale(for requested: String, availableLocales: [String]) -> String {
+        guard !availableLocales.isEmpty else { return requested }
+        let normalized = normalizeLocale(requested)
+        if let exact = availableLocales.first(where: { normalizeLocale($0) == normalized }) {
+            return exact
+        }
+        let language = languageCode(from: requested)
+        if let languageMatch = availableLocales.first(where: { languageCode(from: $0) == language }) {
+            return languageMatch
+        }
+        return requested
+    }
+
+    private static func normalizeLocale(_ s: String) -> String {
+        s.replacingOccurrences(of: "_", with: "-").lowercased()
+    }
+
+    private static func languageCode(from s: String) -> String {
+        normalizeLocale(s).split(separator: "-").first.map(String.init) ?? normalizeLocale(s)
     }
     #endif
 }

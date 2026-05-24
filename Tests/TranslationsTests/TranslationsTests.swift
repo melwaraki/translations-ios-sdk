@@ -59,13 +59,15 @@ final class XcstringsCacheTests: XCTestCase {
           "extractionState": "manual",
           "localizations": {
             "en": { "stringUnit": { "state": "translated", "value": "Hello, world" } },
-            "fr": { "stringUnit": { "state": "translated", "value": "Bonjour, le monde" } }
+            "fr": { "stringUnit": { "state": "translated", "value": "Bonjour, le monde" } },
+            "ar": { "stringUnit": { "state": "translated", "value": "مرحبا بالعالم" } }
           }
         },
         "buy.button": {
           "localizations": {
             "en": { "stringUnit": { "state": "translated", "value": "Buy now" } },
-            "fr": { "stringUnit": { "state": "translated", "value": "Acheter" } }
+            "fr": { "stringUnit": { "state": "translated", "value": "Acheter" } },
+            "ar": { "stringUnit": { "state": "translated", "value": "اشتر الآن" } }
           }
         }
       }
@@ -100,7 +102,7 @@ final class XcstringsCacheTests: XCTestCase {
         XCTAssertEqual(lookup?.translations.first?.value, "Acheter")
 
         let locales = await cache.availableLocales()
-        XCTAssertEqual(locales, ["fr"])
+        XCTAssertEqual(locales, ["ar", "fr"])
     }
 
     func testRefreshSendsIfNoneMatchAndHandles304() async throws {
@@ -165,7 +167,8 @@ final class XcstringsCacheTests: XCTestCase {
             strings: ["Hello, world"], locale: "fr", threshold: 0.4
         )
         XCTAssertTrue(matches[0].matched)
-        XCTAssertNotNil(await cache2.lookup(key: "buy.button", locale: "fr"))
+        let lookup = await cache2.lookup(key: "buy.button", locale: "fr")
+        XCTAssertNotNil(lookup)
         XCTAssertEqual(requestCount, 0, "Cached match/lookup must not hit the network")
     }
 
@@ -194,6 +197,35 @@ final class XcstringsCacheTests: XCTestCase {
         XCTAssertTrue(matches.allSatisfy { $0.matched })
         XCTAssertEqual(matches[0].translation, "Bonjour, le monde")
         XCTAssertEqual(matches[1].translation, "Acheter")
+    }
+
+    func testMatchFindsSourceAndActiveLocaleTranslations() async throws {
+        let (cache, mock) = makeCache()
+        mock.handler = { _ in
+            return (HTTPURLResponse(
+                url: URL(string: "https://example.com/")!,
+                statusCode: 200, httpVersion: nil, headerFields: ["ETag": "\"v1\""]
+            )!, Self.sampleDoc)
+        }
+        try await cache.refresh()
+
+        let matches = await cache.match(
+            strings: ["Hello, world", "اشتر الآن", "missing"],
+            locale: "ar-SA",
+            threshold: 0.4
+        )
+
+        XCTAssertTrue(matches[0].matched)
+        XCTAssertEqual(matches[0].key, "hello.world")
+        XCTAssertEqual(matches[0].sourceValue, "Hello, world")
+        XCTAssertEqual(matches[0].translation, "مرحبا بالعالم")
+
+        XCTAssertTrue(matches[1].matched)
+        XCTAssertEqual(matches[1].key, "buy.button")
+        XCTAssertEqual(matches[1].sourceValue, "Buy now")
+        XCTAssertEqual(matches[1].translation, "اشتر الآن")
+
+        XCTAssertFalse(matches[2].matched)
     }
 }
 

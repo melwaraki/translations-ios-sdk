@@ -21,9 +21,16 @@ actor XcstringsCache {
     private let metaURL: URL
 
     private var doc: XcstringsDoc?
+    private var bundledDoc: XcstringsDoc?
     private var meta: Meta?
     /// Source values keyed by lowercased text for fast exact match.
     private var sourceIndex: [String: (key: String, value: String)] = [:]
+
+    private struct MatchCandidate {
+        let key: String
+        let sourceValue: String
+        let matchValue: String
+    }
 
     init(projectId: String, client: APIClient, fileManager: FileManager = .default) {
         self.projectId = projectId
@@ -42,11 +49,16 @@ actor XcstringsCache {
 
     /// Loads any persisted document + meta into memory. Safe to call repeatedly.
     func loadFromDiskIfNeeded() {
+        loadBundledDocumentIfNeeded()
         guard doc == nil else { return }
-        guard let data = try? Data(contentsOf: docURL) else { return }
-        guard let parsed = try? JSONDecoder().decode(XcstringsDoc.self, from: data) else { return }
-        self.doc = parsed
-        self.rebuildIndex()
+        if let data = try? Data(contentsOf: docURL),
+           let parsed = try? JSONDecoder().decode(XcstringsDoc.self, from: data) {
+            self.doc = mergedWithBundledDocument(parsed)
+            self.rebuildIndex()
+        } else if let bundledDoc = bundledDoc {
+            self.doc = bundledDoc
+            self.rebuildIndex()
+        }
         if let metaData = try? Data(contentsOf: metaURL),
            let parsedMeta = try? JSONDecoder().decode(Meta.self, from: metaData) {
             self.meta = parsedMeta
@@ -56,6 +68,14 @@ actor XcstringsCache {
     var hasDocument: Bool { doc != nil }
     var lastFetchedAt: Date? { meta?.fetchedAt }
     var currentEtag: String? { meta?.etag }
+
+    func clear() {
+        doc = nil
+        meta = nil
+        sourceIndex.removeAll()
+        try? FileManager.default.removeItem(at: docURL)
+        try? FileManager.default.removeItem(at: metaURL)
+    }
 
     /// Refreshes the cache against the server. When the server replies 304 the
     /// existing document is kept and `fetchedAt` is bumped.
@@ -68,7 +88,7 @@ actor XcstringsCache {
             persistMeta()
         case .modified(let data, let etag):
             let parsed = try JSONDecoder().decode(XcstringsDoc.self, from: data)
-            self.doc = parsed
+            self.doc = mergedWithBundledDocument(parsed)
             self.meta = Meta(etag: etag, fetchedAt: Date())
             self.rebuildIndex()
             try? data.write(to: docURL, options: .atomic)
@@ -81,6 +101,41 @@ actor XcstringsCache {
         if let data = try? JSONEncoder().encode(meta) {
             try? data.write(to: metaURL, options: .atomic)
         }
+    }
+
+    private func loadBundledDocumentIfNeeded() {
+        guard bundledDoc == nil,
+              let url = Bundle.main.url(forResource: "Localizable", withExtension: "xcstrings"),
+              let data = try? Data(contentsOf: url),
+              let parsed = try? JSONDecoder().decode(XcstringsDoc.self, from: data) else {
+            return
+        }
+        bundledDoc = parsed
+    }
+
+    private func mergedWithBundledDocument(_ primary: XcstringsDoc) -> XcstringsDoc {
+        guard let bundledDoc = bundledDoc else { return primary }
+        var strings = bundledDoc.strings
+        for (key, entry) in primary.strings {
+            if let bundledEntry = strings[key] {
+                var localizations = bundledEntry.localizations ?? [:]
+                for (code, localization) in entry.localizations ?? [:] {
+                    localizations[code] = localization
+                }
+                strings[key] = XcstringsEntry(
+                    comment: entry.comment ?? bundledEntry.comment,
+                    extractionState: entry.extractionState ?? bundledEntry.extractionState,
+                    localizations: localizations
+                )
+            } else {
+                strings[key] = entry
+            }
+        }
+        return XcstringsDoc(
+            sourceLanguage: primary.sourceLanguage ?? bundledDoc.sourceLanguage,
+            version: primary.version ?? bundledDoc.version,
+            strings: strings
+        )
     }
 
     private func rebuildIndex() {
@@ -106,6 +161,7 @@ actor XcstringsCache {
             }
         }
         let source = doc.sourceLanguage ?? "en"
+        let candidates = matchCandidates(locale: locale, source: source)
         return strings.map { input in
             // 1. Exact match against the lowercased source value index.
             if let hit = sourceIndex[input.lowercased()] {
@@ -116,15 +172,25 @@ actor XcstringsCache {
                     sourceValue: hit.value, translation: translation, similarity: 1.0
                 )
             }
-            // 2. Fuzzy fallback. Walks every entry once; fine for typical
-            //    project sizes (a few thousand strings).
+            // 2. Exact match against the active locale. This is the path used
+            //    when the app is currently rendering translated text.
+            let normalizedInput = normalizeText(input)
+            if let hit = candidates.first(where: { normalizeText($0.matchValue) == normalizedInput }) {
+                let entry = doc.strings[hit.key]
+                let translation = translationValue(in: entry, locale: locale, source: source)
+                return MatchResult(
+                    input: input, matched: true, key: hit.key, stringId: nil,
+                    sourceValue: hit.sourceValue, translation: translation, similarity: 1.0
+                )
+            }
+            // 3. Fuzzy fallback. Walks every source + active-locale candidate
+            //    once; fine for typical project sizes (a few thousand strings).
             var best: (key: String, value: String, sim: Double)? = nil
             let inputTokens = tokenize(input)
-            for (key, entry) in doc.strings {
-                let value = entry.localizations?[source]?.stringUnit?.value ?? key
-                let sim = jaccard(inputTokens, tokenize(value))
+            for candidate in candidates {
+                let sim = jaccard(inputTokens, tokenize(candidate.matchValue))
                 if sim >= threshold && (best == nil || sim > best!.sim) {
-                    best = (key, value, sim)
+                    best = (candidate.key, candidate.sourceValue, sim)
                 }
             }
             if let best = best {
@@ -221,8 +287,39 @@ actor XcstringsCache {
         return nil
     }
 
+    private func matchCandidates(locale: String?, source: String) -> [MatchCandidate] {
+        guard let doc = doc else { return [] }
+        var candidates: [MatchCandidate] = []
+        for (key, entry) in doc.strings {
+            let sourceValue = entry.localizations?[source]?.stringUnit?.value ?? key
+            candidates.append(MatchCandidate(
+                key: key,
+                sourceValue: sourceValue,
+                matchValue: sourceValue
+            ))
+
+            guard let localizedValue = translationValue(in: entry, locale: locale, source: source),
+                  normalizeText(localizedValue) != normalizeText(sourceValue) else {
+                continue
+            }
+            candidates.append(MatchCandidate(
+                key: key,
+                sourceValue: sourceValue,
+                matchValue: localizedValue
+            ))
+        }
+        return candidates
+    }
+
     private func normalizeLocale(_ s: String) -> String {
         s.replacingOccurrences(of: "_", with: "-").lowercased()
+    }
+
+    private func normalizeText(_ s: String) -> String {
+        s
+            .replacingOccurrences(of: "\u{00A0}", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
     }
 
     private func languageCode(from s: String) -> String {
